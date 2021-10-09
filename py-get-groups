@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+
+"""
+Delete all the things
+"""
+
+import gitlab
+from gitlab.exceptions import (
+    GitlabGetError, GitlabDeleteError, GitlabOperationError)
+from argparse import ArgumentParser
+from pathlib import Path
+import sys
+
+max_users = 100
+
+def get_args():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument('-n', '--n-tries', default=1)
+    parser.add_argument('-b', '--blacklist')
+    logging = parser.add_mutually_exclusive_group()
+    logging.add_argument('-l', '--log', help='log deleted files here')
+    logging.add_argument('-a', '--append-to-blacklist',
+                         action='store_true',
+                         help='append deleted files to blacklist')
+    parser.add_argument('-v', '--verbose', action='store_true')
+    return parser.parse_args()
+
+def walk_to_parent(group, gl, verbose=False):
+    pid = group.parent_id
+    my_id = gl.user.id
+    try:
+        member_ids = [m.id for m in group.members.list()]
+        all_ids = [u.id for u in group.members_all.list(per_page=max_users)]
+        me_in_group = group.members_all.get(my_id)
+        if me_in_group:
+            if len(all_ids) == max_users:
+                group.members.delete(my_id)
+                if verbose:
+                    print(f'Deleted group!!! [group={group.name}]')
+                return [(group.id, group.name)]
+        else:
+            print(f'Found group you are not in [group={group.name}]')
+    except gitlab.exceptions.GitlabOperationError as err:
+        if err.response_code != 404:
+            print(f"Strange error [group={group.name}, error={err}]")
+    if pid is None:
+        return []
+    try:
+        parent = gl.groups.get(pid)
+    except gitlab.exceptions.GitlabGetError as err:
+        if err.response_code == 404:
+            return []
+        else:
+            raise
+    return walk_to_parent(parent, gl)
+
+def fast_kill(gl, blacklist, verbose=False):
+    with open(blacklist) as bl:
+        kill_list = [int(l.split()[0]) for l in bl.readlines()]
+    uid = gl.user.id
+    n_del = 0
+    for gid in kill_list:
+        try:
+            gl.groups.get(gid).members.delete(uid)
+            n_del += 1
+            if verbose:
+                print(f'Deleted group [gid={gid}]')
+        except gitlab.exceptions.GitlabOperationError as err:
+            if err.response_code != 404:
+                print(f'had issue deleting group, [gid={gid}, error={err}]')
+    if n_del > 0 or verbose:
+        print(f'Removed blacklisted groups [n_deleted={n_del}]')
+
+def tupify(line):
+    return tuple(line.strip().split(None,1))
+
+def append_to_blacklist(blacklist, deleted):
+    if blacklist is None:
+        black_set = set()
+        blacklist = '/dev/stdout'
+    else:
+        with open(blacklist) as bl:
+            black_set = set(tupify(x) for x in bl.readlines())
+    n_old_set = len(black_set)
+    black_set |= set(deleted)
+    n_added = len(black_set) - n_old_set
+    if n_added > 0:
+        print(f'Adding entries to blacklist [n_added={n_added}]')
+        write_out_log(blacklist, black_set)
+
+def write_out_log(log, deleted):
+    with open(log, 'w') as logout:
+        del_list = sorted(deleted, key=lambda x: x[1].lower())
+        for id, name in del_list:
+            logout.write(f'{id:>8} {name}\n')
+
+def run():
+    args = get_args()
+    token_path = Path('~/.gitlab-api-token')
+    with open(token_path.expanduser()) as tokenfile:
+        token = tokenfile.read().strip()
+    gl = gitlab.Gitlab('https://gitlab.cern.ch', private_token=token)
+    gl.auth()
+    if args.blacklist:
+        fast_kill(gl, args.blacklist, args.verbose)
+    deleted = []
+    for _ in range(args.n_tries):
+        deleted += delete_groups(gl, args.verbose)
+    if args.append_to_blacklist:
+        append_to_blacklist(args.blacklist, deleted)
+    elif args.log:
+        write_out_log(args.log, deleted)
+    if args.verbose:
+        print('Done')
+
+def delete_groups(gl, verbose):
+    groups = gl.groups.list(per_page=100)
+    if verbose:
+        print(f'Checking groups [n_check={len(groups)}]')
+    deleted = []
+    for group in groups:
+        deleted += walk_to_parent(group, gl, verbose)
+    return deleted
+
+if __name__ == '__main__':
+    run()
