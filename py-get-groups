@@ -9,7 +9,7 @@ from gitlab.exceptions import (
     GitlabGetError, GitlabDeleteError, GitlabOperationError)
 from argparse import ArgumentParser
 from pathlib import Path
-import sys
+import sys, logging
 
 max_users = 100
 
@@ -18,14 +18,15 @@ def get_args():
     parser.add_argument('-n', '--n-tries', default=1)
     parser.add_argument('-b', '--blacklist')
     logging = parser.add_mutually_exclusive_group()
-    logging.add_argument('-l', '--log', help='log deleted files here')
+    logging.add_argument('-l', '--group-list', help='list deleted files here')
     logging.add_argument('-a', '--append-to-blacklist',
                          action='store_true',
                          help='append deleted files to blacklist')
     parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-o', '--logging-output')
     return parser.parse_args()
 
-def walk_to_parent(group, gl, verbose=False):
+def walk_to_parent(group, gl, log):
     pid = group.parent_id
     my_id = gl.user.id
     try:
@@ -35,14 +36,13 @@ def walk_to_parent(group, gl, verbose=False):
         if me_in_group:
             if len(all_ids) == max_users:
                 group.members.delete(my_id)
-                if verbose:
-                    print(f'Deleted group!!! [group={group.name}]')
+                log.debug(f'Deleted group!!! [group={group.name}]')
                 return [(group.id, group.name)]
         else:
-            print(f'Found group you are not in [group={group.name}]')
+            log.info(f'Found group you are not in [group={group.name}]')
     except gitlab.exceptions.GitlabOperationError as err:
         if err.response_code != 404:
-            print(f"Strange error [group={group.name}, error={err}]")
+            log.warning(f"Strange error [group={group.name}, error={err}]")
     if pid is None:
         return []
     try:
@@ -52,9 +52,9 @@ def walk_to_parent(group, gl, verbose=False):
             return []
         else:
             raise
-    return walk_to_parent(parent, gl)
+    return walk_to_parent(parent, gl, log)
 
-def fast_kill(gl, blacklist, verbose=False):
+def fast_kill(gl, blacklist, log):
     with open(blacklist) as bl:
         kill_list = [int(l.split()[0]) for l in bl.readlines()]
     uid = gl.user.id
@@ -63,18 +63,19 @@ def fast_kill(gl, blacklist, verbose=False):
         try:
             gl.groups.get(gid).members.delete(uid)
             n_del += 1
-            if verbose:
-                print(f'Deleted group [gid={gid}]')
+            log.debug(f'Deleted group [gid={gid}]')
         except gitlab.exceptions.GitlabOperationError as err:
-            if err.response_code != 404:
-                print(f'had issue deleting group, [gid={gid}, error={err}]')
-    if n_del > 0 or verbose:
-        print(f'Removed blacklisted groups [n_deleted={n_del}]')
+            if err.response_code == 404:
+                log.debug(f'No group [gid={gid}]')
+            else:
+                log.warning(f'Issue deleting group, [gid={gid}, error={err}]')
+    if n_del > 0:
+        log.info(f'Removed blacklisted groups [n_deleted={n_del}]')
 
 def tupify(line):
     return tuple(line.strip().split(None,1))
 
-def append_to_blacklist(blacklist, deleted):
+def append_to_blacklist(blacklist, deleted, log):
     if blacklist is None:
         black_set = set()
         blacklist = '/dev/stdout'
@@ -85,41 +86,57 @@ def append_to_blacklist(blacklist, deleted):
     black_set |= set(deleted)
     n_added = len(black_set) - n_old_set
     if n_added > 0:
-        print(f'Adding entries to blacklist [n_added={n_added}]')
-        write_out_log(blacklist, black_set)
+        log.info(f'Adding entries to blacklist [n_added={n_added}]')
+        write_out_blacklist(blacklist, black_set)
 
-def write_out_log(log, deleted):
-    with open(log, 'w') as logout:
+def write_out_blacklist(black, deleted):
+    with open(black, 'w') as blackout:
         del_list = sorted(deleted, key=lambda x: x[1].lower())
         for id, name in del_list:
-            logout.write(f'{id:>8} {name}\n')
+            blackout.write(f'{id:>8} {name}\n')
+
+def get_logger(args):
+    log = logging.getLogger(__name__)
+    log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    if args.logging_output:
+        ch = logging.FileHandler(args.logging_output)
+        ch.setFormatter(logging.Formatter(
+        '{asctime} {message}', datefmt='%Y-%m-%d-%H:%M', style='{'))
+        log.addHandler(ch)
+        warn_handler = logging.StreamHandler()
+        warn_handler.setLevel(logging.WARNING)
+        log.addHandler(warn_handler)
+    else:
+        ch = logging.StreamHandler(sys.stdout)
+        log.addHandler(ch)
+    return log
 
 def run():
     args = get_args()
+    log = get_logger(args)
+    log.debug('Starting progrem')
     token_path = Path('~/.gitlab-api-token')
     with open(token_path.expanduser()) as tokenfile:
         token = tokenfile.read().strip()
     gl = gitlab.Gitlab('https://gitlab.cern.ch', private_token=token)
     gl.auth()
     if args.blacklist:
-        fast_kill(gl, args.blacklist, args.verbose)
+        fast_kill(gl, args.blacklist, log)
     deleted = []
     for _ in range(args.n_tries):
-        deleted += delete_groups(gl, args.verbose)
+        deleted += delete_groups(gl, log)
     if args.append_to_blacklist:
-        append_to_blacklist(args.blacklist, deleted)
-    elif args.log:
-        write_out_log(args.log, deleted)
-    if args.verbose:
-        print('Done')
+        append_to_blacklist(args.blacklist, deleted, log)
+    elif args.group_list:
+        write_out_blacklist(args.group_list, deleted)
+    log.debug('Done')
 
-def delete_groups(gl, verbose):
+def delete_groups(gl, log):
     groups = gl.groups.list(per_page=100)
-    if verbose:
-        print(f'Checking groups [n_check={len(groups)}]')
+    log.debug(f'Checking groups [n_check={len(groups)}]')
     deleted = []
     for group in groups:
-        deleted += walk_to_parent(group, gl, verbose)
+        deleted += walk_to_parent(group, gl, log)
     return deleted
 
 if __name__ == '__main__':
