@@ -17,6 +17,7 @@ def get_args():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument('-n', '--n-tries', default=1)
     parser.add_argument('-b', '--blacklist')
+    parser.add_argument('-w', '--whitelist')
     logging = parser.add_mutually_exclusive_group()
     logging.add_argument('-l', '--group-list', help='list deleted files here')
     logging.add_argument('-a', '--append-to-blacklist',
@@ -26,7 +27,7 @@ def get_args():
     parser.add_argument('-o', '--logging-output')
     return parser.parse_args()
 
-def walk_to_parent(group, gl, log):
+def walk_to_parent(group, gl, log, white_id):
     pid = group.parent_id
     my_id = gl.user.id
     try:
@@ -35,6 +36,9 @@ def walk_to_parent(group, gl, log):
         me_in_group = group.members_all.get(my_id)
         if me_in_group:
             if len(all_ids) == max_users:
+                if group.id in white_id:
+                    log.debug(f'Group whitelisted [group={group.name}]')
+                    return []
                 group.members.delete(my_id)
                 log.debug(f'Deleted group!!! [group={group.name}]')
                 return [(group.id, group.name)]
@@ -52,7 +56,7 @@ def walk_to_parent(group, gl, log):
             return []
         else:
             raise
-    return walk_to_parent(parent, gl, log)
+    return walk_to_parent(parent, gl, log, white_id)
 
 def fast_kill(gl, blacklist, log):
     with open(blacklist) as bl:
@@ -124,19 +128,22 @@ def run():
         fast_kill(gl, args.blacklist, log)
     deleted = []
     for _ in range(args.n_tries):
-        deleted += delete_groups(gl, log)
+        deleted += delete_groups(gl, log, args.whitelist)
     if args.append_to_blacklist:
         append_to_blacklist(args.blacklist, deleted, log)
     elif args.group_list:
         write_out_blacklist(args.group_list, deleted)
     log.debug('Done')
 
-def delete_groups(gl, log):
+def delete_groups(gl, log, whitelist):
+    if whitelist:
+        with open(whitelist) as wl:
+            white_id = set(int(l.split()[0]) for l in wl.readlines())
     groups = gl.groups.list(per_page=100)
     log.debug(f'Checking groups [n_check={len(groups)}]')
     deleted = []
     for group in groups:
-        deleted += walk_to_parent(group, gl, log)
+        deleted += walk_to_parent(group, gl, log, white_id)
     return deleted
 
 if __name__ == '__main__':
