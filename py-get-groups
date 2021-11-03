@@ -136,6 +136,7 @@ def run():
     log.debug('Done')
 
 def delete_groups(gl, log, whitelist):
+    white_id = set()
     if whitelist:
         with open(whitelist) as wl:
             white_id = set(int(l.split()[0]) for l in wl.readlines())
